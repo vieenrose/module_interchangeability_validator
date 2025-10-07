@@ -1,0 +1,16 @@
+# Module Interchangeability Validator - Python Standard Library Requirements
+# This tool only uses Python standard libraries, so no external dependencies are needed.
+
+# Required Python version
+python>=3.8
+
+# Standard libraries used:
+# - ast
+# - sys, os, argparse
+# - inspect, difflib, typing
+# - dataclasses
+# - warnings
+# - datetime
+# - importlib
+
+# No external packages required
