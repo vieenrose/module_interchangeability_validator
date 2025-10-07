@@ -19,7 +19,11 @@ import importlib.util
 import inspect
 import difflib
 import argparse
-from typing import Dict, List, Set, Tuple, Any, Optional
+import types
+import tempfile
+import subprocess
+import traceback
+from typing import Dict, List, Set, Tuple, Any, Optional, Callable
 from dataclasses import dataclass
 import warnings
 
@@ -43,12 +47,14 @@ class ModuleAnalysis:
 class ModuleInterchangeabilityValidator:
     """Python module interchangeability validator"""
     
-    def __init__(self, original_file: str, test_file: str, verbose: bool = False):
+    def __init__(self, original_file: str, test_file: str, verbose: bool = False, run_differential: bool = False):
         self.original_file = original_file
         self.test_file = test_file
         self.verbose = verbose
+        self.run_differential = run_differential
         self.original_analysis = None
         self.test_analysis = None
+        self.differential_tester = DifferentialTester(self) if run_differential else None
         
     def log(self, message: str, level: str = "INFO"):
         """Logger with verbosity level"""
@@ -397,7 +403,7 @@ class ModuleInterchangeabilityValidator:
             'extra_from_imports': list(test_imports['from_imports'] - orig_imports['from_imports']),
             'compatible_imports': len(set(orig_imports['direct_imports']) & set(test_imports['direct_imports'])) + 
                               len(set(orig_imports['from_imports']) & set(test_imports['from_imports']))
-        }
+        };
         
         return results
     
@@ -449,9 +455,27 @@ class ModuleInterchangeabilityValidator:
             self.log(f"Unable to analyze test file: {self.test_file}", "ERROR")
             return False
         
+        # Run differential tests if requested
+        if self.run_differential and self.differential_tester:
+            self.differential_tester.run_differential_tests()
+        
         # Calculate final score
         score = self.calculate_compatibility_score()
         is_interchangeable = score >= 85
+        
+        # Adjust score based on differential tests if available
+        if self.run_differential and self.differential_tester and self.differential_tester.test_results:
+            total_diff_tests = len(self.differential_tester.test_results)
+            passed_diff_tests = sum(1 for r in self.differential_tester.test_results if r.passed)
+            
+            if total_diff_tests > 0:
+                diff_score = (passed_diff_tests / total_diff_tests) * 100
+                # Weight the scores: 70% static analysis, 30% differential testing
+                final_score = (score * 0.7) + (diff_score * 0.3)
+                score = final_score
+                is_interchangeable = score >= 85
+                
+                self.log(f"🧪 Differential tests: {passed_diff_tests}/{total_diff_tests} passed", "INFO")
         
         self.log(f"🎯 Final score: {score:.1f}/100", "SUCCESS" if is_interchangeable else "WARNING")
         self.log(f"🔄 Interchangeability: {'✅ VALIDATED' if is_interchangeable else '❌ NOT VALIDATED'}", 
@@ -601,8 +625,344 @@ class ModuleInterchangeabilityValidator:
             for imp in import_analysis['extra_direct_imports']:
                 report.append(f"  + {imp}")
         
+        # Differential testing results
+        if self.run_differential and self.differential_tester and self.differential_tester.test_results:
+            diff_report = self.differential_tester.generate_differential_report()
+            report.append(diff_report)
+        
         report.append("")
         report.append("=" * 80)
+        
+        return "\n".join(report)
+
+@dataclass
+class DifferentialTestResult:
+    """Structure to store differential test results"""
+    test_name: str
+    function_name: str
+    original_result: Any
+    test_result: Any
+    passed: bool
+    error_msg: Optional[str] = None
+    execution_time_original: float = 0.0
+    execution_time_test: float = 0.0
+
+class DifferentialTester:
+    """Differential testing for module behavior validation"""
+    
+    def __init__(self, validator: 'ModuleInterchangeabilityValidator'):
+        self.validator = validator
+        self.test_results: List[DifferentialTestResult] = []
+        
+    def create_safe_test_environment(self) -> Dict[str, Any]:
+        """Create a safe environment for testing functions"""
+        safe_env = {
+            # Built-in functions
+            '__builtins__': {
+                '__import__': __import__,
+                'print': lambda *args, **kwargs: None,  # Suppress print
+                'len': len,
+                'str': str,
+                'int': int,
+                'float': float,
+                'bool': bool,
+                'list': list,
+                'dict': dict,
+                'tuple': tuple,
+                'set': set,
+                'range': range,
+                'enumerate': enumerate,
+                'zip': zip,
+                'min': min,
+                'max': max,
+                'sum': sum,
+                'abs': abs,
+                'round': round,
+                'isinstance': isinstance,
+                'type': type,
+                'hasattr': hasattr,
+                'getattr': getattr,
+                'setattr': setattr,
+                'delattr': delattr,
+            },
+            # Common modules
+            'math': __import__('math'),
+            'random': __import__('random'),
+            'datetime': __import__('datetime'),
+            're': __import__('re'),
+            'json': __import__('json'),
+            'os': __import__('os'),
+            'sys': __import__('sys'),
+            'time': __import__('time'),
+            'threading': __import__('threading'),
+            'queue': __import__('queue'),
+            'io': __import__('io'),
+            'signal': __import__('signal'),
+            'warnings': __import__('warnings'),
+        }
+        return safe_env
+    
+    def load_module_safely(self, filepath: str) -> Optional[types.ModuleType]:
+        """Load a module in a safe environment"""
+        try:
+            module_name = os.path.basename(filepath).replace('.py', '_test')
+            
+            # Read the source code directly
+            with open(filepath, 'r', encoding='utf-8') as f:
+                source_code = f.read()
+            
+            # Create a safe environment
+            safe_env = self.create_safe_test_environment()
+            safe_env['__name__'] = module_name
+            safe_env['__file__'] = filepath
+            
+            # Execute the module in safe environment
+            exec(source_code, safe_env)
+            
+            # Create a module object
+            module = types.ModuleType(module_name)
+            module.__file__ = filepath
+            
+            # Copy safe attributes to module
+            for name, obj in safe_env.items():
+                if not name.startswith('__') or name in ['__name__', '__file__']:
+                    setattr(module, name, obj)
+            
+            return module
+        except Exception as e:
+            self.validator.log(f"Error loading module {filepath}: {e}", "DEBUG")
+        return None
+    
+    def create_test_inputs(self, func_signature: Dict[str, Any]) -> List[Tuple[List, Dict]]:
+        """Create test input combinations for a function"""
+        test_cases = []
+        
+        args = func_signature.get('args', [])
+        
+        # Generate test cases based on argument types
+        if len(args) == 0:
+            # No arguments - single call with empty args
+            test_cases.append(([], {}))
+        elif len(args) <= 3:
+            # Small number of arguments - generate combinations
+            basic_values = [
+                [],                    # Empty list
+                [1, 2, 3],            # List of numbers
+                ["hello", "world"],   # List of strings
+                [{"key": "value"}],    # List of dicts
+            ]
+            
+            for i, value_set in enumerate(basic_values[:len(args) + 1]):
+                test_args = value_set[:len(args)]
+                test_cases.append((test_args, {}))
+        else:
+            # Many arguments - use minimal test
+            test_cases.append(([None] * len(args), {}))
+        
+        return test_cases
+    
+    def execute_function_safely(self, func: Callable, args: List, kwargs: Dict) -> Tuple[Any, float, Optional[str]]:
+        """Execute a function safely and return result, time, and error"""
+        import time
+        import signal
+        start_time = time.time()
+        
+        try:
+            # Set timeout for execution
+            def timeout_handler(signum, frame):
+                raise TimeoutError("Function execution timeout")
+            
+            signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(5)  # 5 second timeout
+            
+            result = func(*args, **kwargs)
+            
+            signal.alarm(0)  # Cancel timeout
+            
+            execution_time = time.time() - start_time
+            return result, execution_time, None
+            
+        except Exception as e:
+            execution_time = time.time() - start_time
+            error_msg = f"{type(e).__name__}: {str(e)}"
+            return None, execution_time, error_msg
+        finally:
+            try:
+                signal.alarm(0)  # Cancel timeout
+            except:
+                pass
+    
+    def compare_results(self, result1: Any, result2: Any) -> bool:
+        """Compare two results for equality"""
+        try:
+            # Direct comparison
+            if result1 == result2:
+                return True
+            
+            # Type comparison
+            if type(result1) != type(result2):
+                return False
+            
+            # For collections, compare elements
+            if isinstance(result1, (list, tuple)):
+                if len(result1) != len(result2):
+                    return False
+                return all(self.compare_results(r1, r2) for r1, r2 in zip(result1, result2))
+            
+            elif isinstance(result1, dict):
+                if set(result1.keys()) != set(result2.keys()):
+                    return False
+                return all(self.compare_results(result1[k], result2[k]) for k in result1.keys())
+            
+            # String comparison with normalization
+            elif isinstance(result1, str):
+                return result1.strip() == result2.strip()
+            
+            return False
+            
+        except Exception:
+            return False
+    
+    def test_function_differentially(self, func_name: str) -> List[DifferentialTestResult]:
+        """Test a function differentially between original and test modules"""
+        results = []
+        
+        if not self.validator.original_analysis or not self.validator.test_analysis:
+            return results
+        
+        orig_funcs = self.validator.original_analysis.functions
+        test_funcs = self.validator.test_analysis.functions
+        
+        if func_name not in orig_funcs or func_name not in test_funcs:
+            return results
+        
+        # Load modules safely
+        orig_module = self.load_module_safely(self.validator.original_file)
+        test_module = self.load_module_safely(self.validator.test_file)
+        
+        if not orig_module or not test_module:
+            return results
+        
+        # Get functions
+        orig_func = getattr(orig_module, func_name, None)
+        test_func = getattr(test_module, func_name, None)
+        
+        if not orig_func or not test_func:
+            return results
+        
+        # Create test inputs
+        func_signature = orig_funcs[func_name]
+        test_cases = self.create_test_inputs(func_signature)
+        
+        for i, (args, kwargs) in enumerate(test_cases):
+            test_name = f"{func_name}_test_{i+1}"
+            
+            # Execute original function
+            orig_result, orig_time, orig_error = self.execute_function_safely(orig_func, args, kwargs)
+            
+            # Execute test function
+            test_result, test_time, test_error = self.execute_function_safely(test_func, args, kwargs)
+            
+            # Compare results
+            if orig_error or test_error:
+                # Both should have the same error type
+                passed = (orig_error is not None and test_error is not None and 
+                         type(orig_error.split(':')[0]) == type(test_error.split(':')[0]))
+                error_msg = f"Original: {orig_error}, Test: {test_error}" if not passed else None
+            else:
+                passed = self.compare_results(orig_result, test_result)
+                error_msg = None
+            
+            result = DifferentialTestResult(
+                test_name=test_name,
+                function_name=func_name,
+                original_result=orig_result,
+                test_result=test_result,
+                passed=passed,
+                error_msg=error_msg,
+                execution_time_original=orig_time,
+                execution_time_test=test_time
+            )
+            
+            results.append(result)
+        
+        return results
+    
+    def run_differential_tests(self, max_functions_per_module: int = 10) -> List[DifferentialTestResult]:
+        """Run differential tests on compatible functions"""
+        self.validator.log("Running differential tests...", "INFO")
+        
+        all_results = []
+        
+        if not self.validator.original_analysis or not self.validator.test_analysis:
+            self.validator.log("Cannot run differential tests: missing module analysis", "WARNING")
+            return all_results
+        
+        orig_funcs = self.validator.original_analysis.functions
+        test_funcs = self.validator.test_analysis.functions
+        
+        # Find common functions
+        common_functions = set(orig_funcs.keys()) & set(test_funcs.keys())
+        
+        # Limit the number of functions to test
+        test_functions = list(common_functions)[:max_functions_per_module]
+        
+        for func_name in test_functions:
+            self.validator.log(f"Testing function: {func_name}", "DEBUG")
+            
+            try:
+                results = self.test_function_differentially(func_name)
+                all_results.extend(results)
+            except Exception as e:
+                self.validator.log(f"Error testing function {func_name}: {e}", "DEBUG")
+        
+        self.test_results = all_results
+        return all_results
+    
+    def generate_differential_report(self) -> str:
+        """Generate a differential test report"""
+        if not self.test_results:
+            return "No differential tests performed."
+        
+        report = []
+        report.append("")
+        report.append("🧪 DIFFERENTIAL TESTING RESULTS")
+        report.append("-" * 40)
+        
+        total_tests = len(self.test_results)
+        passed_tests = sum(1 for r in self.test_results if r.passed)
+        failed_tests = total_tests - passed_tests
+        
+        report.append(f"Total tests: {total_tests}")
+        report.append(f"✅ Passed: {passed_tests}")
+        report.append(f"❌ Failed: {failed_tests}")
+        report.append(f"Success rate: {(passed_tests/total_tests)*100:.1f}%")
+        report.append("")
+        
+        # Group results by function
+        results_by_function = {}
+        for result in self.test_results:
+            if result.function_name not in results_by_function:
+                results_by_function[result.function_name] = []
+            results_by_function[result.function_name].append(result)
+        
+        for func_name, results in results_by_function.items():
+            func_passed = sum(1 for r in results if r.passed)
+            func_total = len(results)
+            
+            report.append(f"🔧 {func_name}: {func_passed}/{func_total} tests passed")
+            
+            # Show failed tests
+            failed_results = [r for r in results if not r.passed]
+            for result in failed_results:
+                report.append(f"  ❌ {result.test_name}")
+                if result.error_msg:
+                    report.append(f"     Error: {result.error_msg}")
+                else:
+                    report.append(f"     Original: {result.original_result}")
+                    report.append(f"     Test: {result.test_result}")
+            
+            report.append("")
         
         return "\n".join(report)
 
@@ -627,6 +987,8 @@ Usage examples:
                        help='Output file for the report (optional)')
     parser.add_argument('--score-only', '-s', action='store_true',
                        help='Display only the compatibility score')
+    parser.add_argument('--differential', '-d', action='store_true',
+                       help='Run differential behavioral tests for more realistic validation')
     
     args = parser.parse_args()
     
@@ -643,7 +1005,8 @@ Usage examples:
     validator = ModuleInterchangeabilityValidator(
         original_file=args.original,
         test_file=args.test,
-        verbose=args.verbose
+        verbose=args.verbose,
+        run_differential=args.differential
     )
     
     # Run the validation

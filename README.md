@@ -26,6 +26,7 @@ python module_interchangeability_validator.py <original_file.py> <test_file.py> 
 - `--verbose, -v` : Verbose mode for debugging
 - `--output, -o <file>` : Save report to a file
 - `--score-only, -s` : Display only the compatibility score
+- `--differential, -d` : Run differential behavioral tests for more realistic validation
 
 ### Usage examples
 
@@ -47,6 +48,67 @@ python module_interchangeability_validator.py original.py test.py --output repor
 #### 4. Silent validation (score only)
 ```bash
 python module_interchangeability_validator.py original.py test.py -s
+```
+
+#### 5. Differential behavioral testing
+```bash
+python module_interchangeability_validator.py original.py test.py --differential
+```
+
+#### 6. Full validation with differential testing and verbose output
+```bash
+python module_interchangeability_validator.py original.py test.py -d -v
+```
+
+## 🧪 Differential Testing
+
+The validator now includes **differential behavioral testing** for more realistic validation:
+
+### What is Differential Testing?
+
+Differential testing executes functions from both modules with various inputs and compares their actual behavior, not just their structure. This provides:
+
+- **Runtime behavior validation**
+- **Output consistency checking**
+- **Error handling verification**
+- **Performance comparison**
+
+### Features
+
+- **Safe execution environment**: Functions run in isolated sandbox
+- **Automatic test case generation**: Creates relevant test inputs based on function signatures
+- **Timeout protection**: Prevents infinite loops or long-running functions
+- **Result comparison**: Intelligent comparison of complex data structures
+- **Error handling**: Compares error types and messages
+
+### Test Coverage
+
+- Functions with compatible signatures are tested automatically
+- Various input combinations are generated based on parameter types
+- Edge cases are included (empty lists, None values, etc.)
+- Execution time is measured and compared
+
+### Scoring System
+
+When differential testing is enabled:
+- **70%** weight for static analysis (structure, signatures, imports)
+- **30%** weight for differential testing (actual behavior)
+- Final score determines interchangeability
+
+### Example Output
+
+```
+🧪 DIFFERENTIAL TESTING RESULTS
+----------------------------------------
+Total tests: 12
+✅ Passed: 10
+❌ Failed: 2
+Success rate: 83.3%
+
+🔧 add_numbers: 1/3 tests passed
+  ❌ add_numbers_test_2
+     Original: 3
+     Test: 4
 ```
 
 ## 📊 Understanding the results
